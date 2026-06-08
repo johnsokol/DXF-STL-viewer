@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simple DXF Viewer</title>
+<style>
+  :root { --bg:#1e1e1e; --panel:#252526; --fg:#d4d4d4; --accent:#4ec9b0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  #app { display:flex; flex-direction:column; height:100%; }
+  header { display:flex; align-items:center; gap:12px; padding:8px 12px; background:var(--panel); border-bottom:1px solid #333; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; color:var(--accent); font-weight:600; }
+  .btn { background:#0e639c; color:#fff; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-size:13px; }
+  .btn:hover { background:#1177bb; }
+  .btn.secondary { background:#3a3d41; }
+  .btn.secondary:hover { background:#4a4d51; }
+  #file { display:none; }
+  #status { font-size:12px; color:#999; margin-left:auto; }
+  #stage { flex:1; position:relative; overflow:hidden; }
+  canvas { display:block; width:100%; height:100%; cursor:grab; }
+  canvas.panning { cursor:grabbing; }
+  #drop { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+          color:#666; font-size:18px; pointer-events:none; text-align:center; }
+  #drop.hide { display:none; }
+  #drop .box { border:2px dashed #444; border-radius:12px; padding:40px 60px; }
+  .pill { font-size:11px; background:#333; padding:2px 8px; border-radius:10px; color:#bbb; }
+  footer { font-size:11px; color:#777; padding:4px 12px; background:var(--panel); border-top:1px solid #333; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>◰ Simple DXF Viewer</h1>
+    <button class="btn" id="open">Open DXF…</button>
+    <button class="btn secondary" id="fit">Fit</button>
+    <input type="file" id="file" accept=".dxf,.DXF">
+    <span class="pill" id="entcount">0 entities</span>
+    <span id="status">Drop a .dxf file or click Open</span>
+  </header>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="drop"><div class="box">Drag &amp; drop a <b>.dxf</b> file here<br><small>or click “Open DXF…”</small></div></div>
+  </div>
+  <footer id="coords">Scroll = zoom · Drag = pan · Double-click = fit</footer>
+</div>
+
+<script>
+"use strict";
+
+/* ---------------- DXF parser ---------------- */
+// Parses the tagged group-code/value pairs and pulls out drawable ENTITIES.
+function parseDXF(text) {
+  const lines = text.split(/\r\n|\r|\n/);
+  const pairs = [];
+  for (let i = 0; i + 1 < lines.length; i += 2) {
+    const code = parseInt(lines[i].trim(), 10);
+    if (Number.isNaN(code)) continue;
+    pairs.push([code, lines[i + 1]]);
+  }
+
+  // Find ENTITIES section (also accept entities that appear in BLOCKS).
+  const entities = [];
+  let i = 0;
+  // Walk all pairs; collect any time we hit a known entity type after a 0 code.
+  // We restrict to the ENTITIES section when present, else scan everything.
+  let inEntities = false, hasEntitiesSection = false;
+  for (let k = 0; k < pairs.length; k++) {
+    if (pairs[k][0] === 2 && pairs[k][1].trim() === "ENTITIES") { hasEntitiesSection = true; break; }
+  }
+
+  const KNOWN = new Set(["LINE","CIRCLE","ARC","LWPOLYLINE","POLYLINE","VERTEX","SEQEND",
+                         "POINT","TEXT","MTEXT","SOLID","ELLIPSE","SPLINE","3DFACE","DIMENSION"]);
+
+  function readEntity(start) {
+    // start points at the [0, TYPE] pair. Collect subsequent pairs until next 0 code.
+    const type = pairs[start][1].trim();
+    const ent = { type, codes: {}, pts: [] };
+    let j = start + 1;
+    let cur = {}; // for accumulating x/y/z triples
+    const list = [];
+    for (; j < pairs.length && pairs[j][0] !== 0; j++) {
+      const [c, vRaw] = pairs[j];
+      const v = vRaw.trim();
+      list.push([c, v]);
+    }
+    ent.raw = list;
+    return [ent, j];
+  }
+
+  for (let k = 0; k < pairs.length; k++) {
+    const [code, valRaw] = pairs[k];
+    const val = valRaw.trim();
+    if (code === 0) {
+      if (val === "SECTION") {
+        const next = pairs[k + 1];
+        inEntities = next && next[0] === 2 && next[1].trim() === "ENTITIES";
+        continue;
+      }
+      if (val === "ENDSEC") { inEntities = false; continue; }
+      const consider = hasEntitiesSection ? inEntities : true;
+      if (consider && KNOWN.has(val)) {
+        const [ent, next] = readEntity(k);
+        entities.push(ent);
+        k = next - 1;
+      }
+    }
+  }
+  return entities;
+}
+
+// Convert raw code list into convenient fields.
+function field(raw, code, def) {
+  for (const [c, v] of raw) if (c === code) return v;
+  return def;
+}
+function fieldNum(raw, code, def) {
+  const v = field(raw, code, undefined);
+  return v === undefined ? def : parseFloat(v);
+}
+
+/* ---------------- geometry build ---------------- */
+// Turn parsed entities into flat primitives: polylines (array of [x,y]) + circles/arcs.
+function buildGeometry(entities) {
+  const polys = [];      // {pts:[[x,y]...], closed:bool}
+  const arcs = [];       // {cx,cy,r,a0,a1}  (a0,a1 in radians, CCW)
+  const circles = [];    // {cx,cy,r}
+  const points = [];     // [x,y]
+  const texts = [];      // {x,y,h,text}
+
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    const r = e.raw;
+    switch (e.type) {
+      case "LINE": {
+        const x1 = fieldNum(r,10,0), y1 = fieldNum(r,20,0);
+        const x2 = fieldNum(r,11,0), y2 = fieldNum(r,21,0);
+        polys.push({ pts: [[x1,y1],[x2,y2]], closed:false });
+        break;
+      }
+      case "CIRCLE": {
+        circles.push({ cx:fieldNum(r,10,0), cy:fieldNum(r,20,0), r:fieldNum(r,40,0) });
+        break;
+      }
+      case "ARC": {
+        const a0 = fieldNum(r,50,0) * Math.PI/180;
+        const a1 = fieldNum(r,51,0) * Math.PI/180;
+        arcs.push({ cx:fieldNum(r,10,0), cy:fieldNum(r,20,0), r:fieldNum(r,40,0), a0, a1 });
+        break;
+      }
+      case "ELLIPSE": {
+        // center 10/20, major endpoint 11/21 (relative), ratio 40, start 41, end 42
+        const cx=fieldNum(r,10,0), cy=fieldNum(r,20,0);
+        const mx=fieldNum(r,11,0), my=fieldNum(r,21,0);
+        const ratio=fieldNum(r,40,1), s=fieldNum(r,41,0), en=fieldNum(r,42,2*Math.PI);
+        const major=Math.hypot(mx,my), rot=Math.atan2(my,mx);
+        const pts=[]; const N=64;
+        for (let t=0;t<=N;t++){
+          const ang = s + (en-s)*t/N;
+          const ex = major*Math.cos(ang), ey = major*ratio*Math.sin(ang);
+          pts.push([cx + ex*Math.cos(rot) - ey*Math.sin(rot),
+                    cy + ex*Math.sin(rot) + ey*Math.cos(rot)]);
+        }
+        polys.push({pts, closed:Math.abs((en-s)-2*Math.PI)<1e-6});
+        break;
+      }
+      case "LWPOLYLINE": {
+        const pts = [];
+        let bulges = [];
+        let cx=null, cy=null;
+        for (const [c,v] of r) {
+          if (c === 10) { if (cx!==null) { pts.push([cx,cy]); } cx = parseFloat(v); }
+          else if (c === 20) { cy = parseFloat(v); }
+          else if (c === 42) { /* bulge — ignored for simplicity */ }
+        }
+        if (cx!==null) pts.push([cx,cy]);
+        const closed = (fieldNum(r,70,0) & 1) === 1;
+        if (pts.length) polys.push({ pts, closed });
+        break;
+      }
+      case "POLYLINE": {
+        // Vertices follow as separate VERTEX entities until SEQEND.
+        const closed = (fieldNum(r,70,0) & 1) === 1;
+        const pts = [];
+        let j = i + 1;
+        while (j < entities.length && entities[j].type === "VERTEX") {
+          pts.push([ fieldNum(entities[j].raw,10,0), fieldNum(entities[j].raw,20,0) ]);
+          j++;
+        }
+        if (j < entities.length && entities[j].type === "SEQEND") j++;
+        i = j - 1;
+        if (pts.length) polys.push({ pts, closed });
+        break;
+      }
+      case "SOLID":
+      case "3DFACE": {
+        const p = [];
+        const idx = [[10,20],[11,21],[12,22],[13,23]];
+        for (const [cx,cy] of idx) {
+          const x=fieldNum(r,cx,undefined), y=fieldNum(r,cy,undefined);
+          if (x!==undefined && y!==undefined) p.push([x,y]);
+        }
+        if (e.type==="SOLID" && p.length===4) { const t=p[2]; p[2]=p[3]; p[3]=t; }
+        if (p.length>=3) polys.push({ pts:p, closed:true });
+        break;
+      }
+      case "POINT": {
+        points.push([fieldNum(r,10,0), fieldNum(r,20,0)]);
+        break;
+      }
+      case "TEXT": {
+        texts.push({ x:fieldNum(r,10,0), y:fieldNum(r,20,0), h:fieldNum(r,40,1),
+                     text: field(r,1,"") });
+        break;
+      }
+      case "MTEXT": {
+        // concatenate all 1/3 text codes, strip basic formatting braces
+        let t = "";
+        for (const [c,v] of r) if (c===3 || c===1) t += v;
+        t = t.replace(/\\[A-Za-z][^;]*;/g,"").replace(/[{}]/g,"");
+        texts.push({ x:fieldNum(r,10,0), y:fieldNum(r,20,0), h:fieldNum(r,40,1), text:t });
+        break;
+      }
+      // SPLINE: approximate by its control/fit points polyline
+      case "SPLINE": {
+        const pts=[]; let fx=null,fy=null;
+        for (const [c,v] of r) {
+          if (c===11) { if(fx!==null) pts.push([fx,fy]); fx=parseFloat(v); }   // fit pts
+          else if (c===21) fy=parseFloat(v);
+        }
+        if (fx!==null) pts.push([fx,fy]);
+        if (pts.length<2) { // fall back to control points 10/20
+          fx=null;
+          for (const [c,v] of r){ if(c===10){if(fx!==null)pts.push([fx,fy]);fx=parseFloat(v);} else if(c===20)fy=parseFloat(v);}
+          if(fx!==null)pts.push([fx,fy]);
+        }
+        if (pts.length>=2) polys.push({pts,closed:false});
+        break;
+      }
+      default: break;
+    }
+  }
+  return { polys, arcs, circles, points, texts };
+}
+
+/* ---------------- bounds ---------------- */
+function computeBounds(g) {
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  const ext = (x,y) => { if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; };
+  for (const p of g.polys) for (const [x,y] of p.pts) ext(x,y);
+  for (const c of g.circles) { ext(c.cx-c.r,c.cy-c.r); ext(c.cx+c.r,c.cy+c.r); }
+  for (const a of g.arcs) { ext(a.cx-a.r,a.cy-a.r); ext(a.cx+a.r,a.cy+a.r); }
+  for (const [x,y] of g.points) ext(x,y);
+  for (const t of g.texts) ext(t.x, t.y);
+  if (!isFinite(minX)) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+/* ---------------- viewer ---------------- */
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const dropEl = document.getElementById("drop");
+const statusEl = document.getElementById("status");
+const entcountEl = document.getElementById("entcount");
+const coordsEl = document.getElementById("coords");
+
+let geom = null, bounds = null;
+let view = { scale: 1, ox: 0, oy: 0 }; // world->screen: sx = x*scale+ox ; sy = -y*scale+oy
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = cv.getBoundingClientRect();
+  cv.width = Math.max(1, Math.round(rect.width * dpr));
+  cv.height = Math.max(1, Math.round(rect.height * dpr));
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  draw();
+}
+window.addEventListener("resize", resize);
+
+function cssSize() {
+  const rect = cv.getBoundingClientRect();
+  return { w: rect.width, h: rect.height };
+}
+
+function fit() {
+  if (!bounds) return;
+  const { w, h } = cssSize();
+  const pad = 30;
+  const bw = Math.max(1e-9, bounds.maxX - bounds.minX);
+  const bh = Math.max(1e-9, bounds.maxY - bounds.minY);
+  const s = Math.min((w - 2*pad)/bw, (h - 2*pad)/bh);
+  view.scale = isFinite(s) && s>0 ? s : 1;
+  const cx = (bounds.minX + bounds.maxX)/2;
+  const cy = (bounds.minY + bounds.maxY)/2;
+  view.ox = w/2 - cx*view.scale;
+  view.oy = h/2 + cy*view.scale;
+  draw();
+}
+
+const W2Sx = x => x*view.scale + view.ox;
+const W2Sy = y => -y*view.scale + view.oy;
+const S2Wx = sx => (sx - view.ox)/view.scale;
+const S2Wy = sy => (view.oy - sy)/view.scale;
+
+function draw() {
+  const { w, h } = cssSize();
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = "#1e1e1e";
+  ctx.fillRect(0,0,w,h);
+  if (!geom) return;
+
+  // origin crosshair
+  ctx.strokeStyle = "#333"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(W2Sx(bounds? bounds.minX:0)-1000, W2Sy(0)); ctx.lineTo(W2Sx(0)+1e6, W2Sy(0));
+  ctx.moveTo(W2Sx(0), 0); ctx.lineTo(W2Sx(0), h);
+  ctx.stroke();
+
+  ctx.strokeStyle = "#4ec9b0";
+  ctx.lineWidth = 1;
+  ctx.lineJoin = "round";
+
+  // polylines
+  ctx.beginPath();
+  for (const p of geom.polys) {
+    const pts = p.pts;
+    if (!pts.length) continue;
+    ctx.moveTo(W2Sx(pts[0][0]), W2Sy(pts[0][1]));
+    for (let i=1;i<pts.length;i++) ctx.lineTo(W2Sx(pts[i][0]), W2Sy(pts[i][1]));
+    if (p.closed) ctx.closePath();
+  }
+  ctx.stroke();
+
+  // circles
+  ctx.beginPath();
+  for (const c of geom.circles) {
+    const r = c.r*view.scale;
+    ctx.moveTo(W2Sx(c.cx)+r, W2Sy(c.cy));
+    ctx.arc(W2Sx(c.cx), W2Sy(c.cy), r, 0, 2*Math.PI);
+  }
+  ctx.stroke();
+
+  // arcs (note: y is flipped, so draw clockwise with negated angles)
+  ctx.beginPath();
+  for (const a of geom.arcs) {
+    const r = a.r*view.scale;
+    ctx.moveTo(W2Sx(a.cx + a.r*Math.cos(a.a0)), W2Sy(a.cy + a.r*Math.sin(a.a0)));
+    ctx.arc(W2Sx(a.cx), W2Sy(a.cy), r, -a.a0, -a.a1, true);
+  }
+  ctx.stroke();
+
+  // points
+  ctx.fillStyle = "#ffd700";
+  for (const [x,y] of geom.points) {
+    ctx.fillRect(W2Sx(x)-1.5, W2Sy(y)-1.5, 3, 3);
+  }
+
+  // texts
+  ctx.fillStyle = "#dcdcaa";
+  for (const t of geom.texts) {
+    const px = Math.max(7, t.h*view.scale);
+    if (px > 4 && t.text) {
+      ctx.font = px + "px sans-serif";
+      ctx.fillText(t.text, W2Sx(t.x), W2Sy(t.y));
+    }
+  }
+}
+
+/* ---------------- interaction ---------------- */
+let dragging = false, lastX=0, lastY=0;
+cv.addEventListener("mousedown", e => { dragging=true; lastX=e.clientX; lastY=e.clientY; cv.classList.add("panning"); });
+window.addEventListener("mouseup", () => { dragging=false; cv.classList.remove("panning"); });
+window.addEventListener("mousemove", e => {
+  const rect = cv.getBoundingClientRect();
+  coordsEl.textContent =
+    `x: ${S2Wx(e.clientX-rect.left).toFixed(3)}   y: ${S2Wy(e.clientY-rect.top).toFixed(3)}   ·   scroll=zoom drag=pan dblclick=fit`;
+  if (!dragging) return;
+  view.ox += e.clientX - lastX;
+  view.oy += e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+  draw();
+});
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  const rect = cv.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const wx = S2Wx(mx), wy = S2Wy(my);
+  const factor = e.deltaY < 0 ? 1.15 : 1/1.15;
+  view.scale *= factor;
+  // keep cursor point fixed
+  view.ox = mx - wx*view.scale;
+  view.oy = my + wy*view.scale;
+  draw();
+}, { passive:false });
+cv.addEventListener("dblclick", fit);
+
+/* ---------------- loading ---------------- */
+function loadText(text, name) {
+  try {
+    const ents = parseDXF(text);
+    geom = buildGeometry(ents);
+    bounds = computeBounds(geom);
+    const total = geom.polys.length + geom.circles.length + geom.arcs.length + geom.points.length + geom.texts.length;
+    entcountEl.textContent = total + " drawables";
+    statusEl.textContent = name ? `Loaded: ${name}` : "Loaded";
+    dropEl.classList.add("hide");
+    if (bounds) fit(); else { statusEl.textContent = "No drawable entities found in " + (name||"file"); draw(); }
+  } catch (err) {
+    statusEl.textContent = "Parse error: " + err.message;
+    console.error(err);
+  }
+}
+
+function handleFile(file) {
+  if (!file) return;
+  statusEl.textContent = "Loading " + file.name + "…";
+  const reader = new FileReader();
+  reader.onload = () => loadText(String(reader.result), file.name);
+  reader.onerror = () => statusEl.textContent = "Could not read file";
+  reader.readAsText(file);
+}
+
+const fileInput = document.getElementById("file");
+document.getElementById("open").onclick = () => fileInput.click();
+document.getElementById("fit").onclick = fit;
+fileInput.onchange = e => handleFile(e.target.files[0]);
+
+// drag & drop
+["dragenter","dragover"].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); dropEl.classList.remove("hide"); }));
+document.addEventListener("dragleave", e => { if (e.clientX===0 && e.clientY===0 && geom) dropEl.classList.add("hide"); });
+document.addEventListener("drop", e => {
+  e.preventDefault();
+  const f = e.dataTransfer.files[0];
+  if (f) handleFile(f);
+});
+
+// allow ?file= ... not used; just init
+resize();
+</script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7b341e"/>
+      <stop offset="1" stop-color="#451a0e"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="32" fill="url(#bg)"/>
+  <!-- faint grid -->
+  <g stroke="#8a4a30" stroke-width="1" opacity="0.5">
+    <path d="M48 16V240 M80 16V240 M112 16V240 M144 16V240 M176 16V240 M208 16V240
+             M16 48H240 M16 80H240 M16 112H240 M16 144H240 M16 176H240 M16 208H240"/>
+  </g>
+  <!-- isometric cube (3 visible faces, shaded) -->
+  <!-- top face -->
+  <polygon points="128,56 196,96 128,136 60,96" fill="#5ad0b8"/>
+  <!-- left face -->
+  <polygon points="60,96 128,136 128,200 60,160" fill="#3a9a89"/>
+  <!-- right face -->
+  <polygon points="196,96 128,136 128,200 196,160" fill="#2c7567"/>
+  <!-- edges -->
+  <g fill="none" stroke="#0e2b25" stroke-width="3" stroke-linejoin="round">
+    <polygon points="128,56 196,96 128,136 60,96"/>
+    <polygon points="60,96 128,136 128,200 60,160"/>
+    <polygon points="196,96 128,136 128,200 196,160"/>
+  </g>
+  <text x="128" y="228" text-anchor="middle" font-family="sans-serif" font-size="26"
+        font-weight="700" fill="#f0e2dc">STL</text>
+</svg>
